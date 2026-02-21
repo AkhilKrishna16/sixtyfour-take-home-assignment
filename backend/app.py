@@ -1,5 +1,6 @@
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,11 +11,36 @@ from uuid import uuid4
 import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-app = FastAPI(title="Sixtyfour Workflow Engine")
+
+# Fix 5: clean up completed/failed workflows older than 30 min every 5 min
+async def _cleanup_old_workflows() -> None:
+    while True:
+        await asyncio.sleep(300)
+        cutoff = datetime.now(timezone.utc).timestamp() - 1800
+        async with WORKFLOW_STORE_LOCK:
+            to_remove = [
+                wid for wid, st in WORKFLOWS.items()
+                if st.status in {"completed", "failed"}
+                and st.finished_at is not None
+                and datetime.fromisoformat(st.finished_at).timestamp() < cutoff
+            ]
+            for wid in to_remove:
+                del WORKFLOWS[wid]
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    task = asyncio.create_task(_cleanup_old_workflows())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Sixtyfour Workflow Engine", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +73,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Block(BaseModel):
-    type: Literal["read_csv", "filter", "enrich_lead", "find_email", "save_csv"]
+    type: Literal["read_csv", "filter", "enrich_lead", "find_email", "save_csv", "compute_column"]
     params: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -249,6 +275,7 @@ async def _with_retry(
             if attempt == retries:
                 break
             await asyncio.sleep(base_delay * (2**attempt))
+    print(last_error)
     raise RuntimeError(f"{action_name} failed after {retries + 1} attempts: {last_error}")
 
 
@@ -416,8 +443,13 @@ async def _run_fast_block(state: WorkflowState, block: Block) -> None:
         path = params.get("path")
         if not path:
             raise ValueError("read_csv requires params.path")
-        state.dataframe = pd.read_csv(path)
-        state.total_rows = len(state.dataframe) if state.dataframe is not None else 0
+        df = pd.read_csv(path)
+        if df.empty:
+            raise ValueError(f"CSV at '{path}' is empty — no rows found.")
+        if len(df.columns) == 0:
+            raise ValueError(f"CSV at '{path}' has no columns.")
+        state.dataframe = df
+        state.total_rows = len(df)
         state.rows_processed = state.total_rows
         state.progress_percentage = 100.0
         return
@@ -471,6 +503,59 @@ async def _run_fast_block(state: WorkflowState, block: Block) -> None:
         state.progress_percentage = 100.0
         return
 
+    if block.type == "compute_column":
+        target_col = params.get("column")
+        source_col = params.get("source_column")
+        operator   = params.get("operator", "contains")
+        value      = params.get("value", "")
+
+        if not target_col:
+            raise ValueError("compute_column requires params.column (name of the new column)")
+        if not source_col:
+            raise ValueError("compute_column requires params.source_column")
+        if source_col not in state.dataframe.columns:
+            raise ValueError(
+                f"compute_column: source_column '{source_col}' not found. "
+                f"Available: {list(state.dataframe.columns)}"
+            )
+
+        df = state.dataframe
+        if operator == "equals":
+            df[target_col] = df[source_col] == value
+        elif operator == "not_equals":
+            df[target_col] = df[source_col] != value
+        elif operator == "contains":
+            df[target_col] = df[source_col].astype(str).str.contains(str(value), na=False)
+        elif operator == "not_contains":
+            df[target_col] = ~df[source_col].astype(str).str.contains(str(value), na=False)
+        elif operator == "gt":
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"compute_column operator 'gt' requires a numeric value, got: {value!r}"
+                )
+            df[target_col] = pd.to_numeric(df[source_col], errors="coerce") > num
+        elif operator == "lt":
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"compute_column operator 'lt' requires a numeric value, got: {value!r}"
+                )
+            df[target_col] = pd.to_numeric(df[source_col], errors="coerce") < num
+        elif operator == "not_null":
+            df[target_col] = df[source_col].notna() & (df[source_col].astype(str).str.strip() != "")
+        elif operator == "is_null":
+            df[target_col] = df[source_col].isna() | (df[source_col].astype(str).str.strip() == "")
+        else:
+            raise ValueError(f"compute_column: unsupported operator '{operator}'")
+
+        state.total_rows = len(df)
+        state.rows_processed = len(df)
+        state.progress_percentage = 100.0
+        return
+
     raise ValueError(f"Unsupported fast block: {block.type}")
 
 
@@ -501,7 +586,7 @@ async def _execute_workflow(workflow_id: str, request: WorkflowRunRequest) -> No
                 state.rows_processed = 0
                 state.total_rows = len(state.dataframe) if state.dataframe is not None else 0
 
-            if block.type in {"read_csv", "filter", "save_csv"}:
+            if block.type in {"read_csv", "filter", "save_csv", "compute_column"}:
                 await _run_fast_block(state, block)
             else:
                 await _run_slow_block(state, block, request)
@@ -573,6 +658,24 @@ async def get_workflow_preview(workflow_id: str, limit: int = 10) -> dict[str, A
         "columns": state.dataframe.columns.tolist(),
         "rows": state.dataframe.head(clipped).to_dict(orient="records"),
     }
+
+
+@app.get("/workflows/{workflow_id}/download")
+async def download_workflow_output(workflow_id: str) -> FileResponse:
+    state = WORKFLOWS.get(workflow_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    if not state.output_path:
+        raise HTTPException(status_code=400, detail="No output file available yet.")
+    output = Path(state.output_path)
+    if not output.exists():
+        raise HTTPException(status_code=404, detail="Output file not found on disk.")
+    return FileResponse(
+        path=str(output),
+        media_type="text/csv",
+        filename=output.name,
+        headers={"Content-Disposition": f'attachment; filename="{output.name}"'},
+    )
 
 
 @app.post("/files/upload")
