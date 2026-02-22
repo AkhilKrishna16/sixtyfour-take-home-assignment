@@ -58,7 +58,8 @@ load_dotenv()
 ENRICH_LEAD_ASYNC_URL = "https://api.sixtyfour.ai/enrich-lead-async"
 JOB_STATUS_URL_TEMPLATE = "https://api.sixtyfour.ai/job-status/{task_id}"
 FIND_EMAIL_URL = "https://api.sixtyfour.ai/find-email"
-UPLOAD_DIR = Path("backend/uploads")
+_BACKEND_DIR = Path(__file__).parent
+UPLOAD_DIR = _BACKEND_DIR / "uploads"
 DEFAULT_ENRICH_STRUCT= {
     "name": "The individual's full name",
     "email": "The individual's email address",
@@ -236,6 +237,8 @@ def _build_find_email_payload(
     row_data: dict[str, Any], params: dict[str, Any]
 ) -> dict[str, Any]:
     lead = _row_to_lead_dict(row_data)
+    # Never pass the existing email — the API returns it unchanged if present,
+    # which prevents it from actually searching for an email address.
     if not lead:
         raise ValueError("find_email requires at least one lead field in dataframe row")
 
@@ -330,58 +333,77 @@ async def _run_enrich_lead_block(
         state.progress_percentage = 100.0
         return
 
-    # Cost-controlled mode: one enrich submit + one status fetch per workflow enrich block.
-    target_row_index = row_indices[0]
-    state.total_rows = 1
+    state.total_rows = len(row_indices)
     state.rows_processed = 0
 
-    row_data = {str(k): v for k, v in df.loc[target_row_index].to_dict().items()}
-    payload = _build_enrich_payload(row_data, block.params)
-
-    async def _submit_once() -> str:
-        return await _submit_enrich_job(payload, request.request_timeout_seconds)
-
-    task_id = await _with_retry(
-        "submit_enrich_job",
-        _submit_once,
-        retries=request.max_retries,
-        base_delay=request.backoff_base_seconds,
-    )
-
-    async def _poll_once() -> dict[str, Any]:
-        return await _poll_job_status(task_id, request.request_timeout_seconds)
     failure_states = {"failed", "error", "cancelled", "canceled"}
     success_states = {"completed", "success", "succeeded", "done", "finished"}
-    status_payload: dict[str, Any] | None = None
-    status = ""
+    semaphore = asyncio.Semaphore(request.max_concurrency)
+
+    # ── Phase 1: Submit all rows in parallel (bounded by semaphore) ──────
+    async def _submit_row(row_index: int) -> tuple[int, str]:
+        async with semaphore:
+            row_data = {str(k): v for k, v in df.loc[row_index].to_dict().items()}
+            row_payload = _build_enrich_payload(row_data, block.params)
+
+            async def _once() -> str:
+                return await _submit_enrich_job(row_payload, request.request_timeout_seconds)
+
+            task_id = await _with_retry(
+                "submit_enrich_job",
+                _once,
+                retries=request.max_retries,
+                base_delay=request.backoff_base_seconds,
+            )
+            return row_index, task_id
+
+    submit_tasks = [asyncio.create_task(_submit_row(i)) for i in row_indices]
+    pending: dict[str, int] = {}  # task_id → row_index
+    for fut in asyncio.as_completed(submit_tasks):
+        row_index, task_id = await fut
+        pending[task_id] = row_index
+
+    # ── Phase 2: Poll all pending jobs until complete or timeout ─────────
+    async def _poll_one(tid: str) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            result = await _with_retry(
+                "poll_job_status",
+                lambda: _poll_job_status(tid, request.request_timeout_seconds),
+                retries=request.max_retries,
+                base_delay=request.backoff_base_seconds,
+            )
+            return tid, result
+
     deadline = asyncio.get_running_loop().time() + request.max_poll_seconds
-
-    while asyncio.get_running_loop().time() < deadline:
+    while pending and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(request.poll_interval_seconds)
-        status_payload = await _with_retry(
-            "poll_job_status",
-            _poll_once,
-            retries=request.max_retries,
-            base_delay=request.backoff_base_seconds,
+
+        poll_results = await asyncio.gather(
+            *[_poll_one(tid) for tid in list(pending)],
+            return_exceptions=True,
         )
-        status = _extract_status(status_payload or {})
-        if status in failure_states or status in success_states:
-            break
+        for res in poll_results:
+            if isinstance(res, BaseException):
+                continue
+            task_id, status_payload = res
+            status = _extract_status(status_payload)
+            if status in success_states:
+                row_index = pending.pop(task_id)
+                for key, value in _extract_enrich_fields(status_payload).items():
+                    df.at[row_index, key] = value
+                state.rows_processed += 1
+                state.progress_percentage = round(
+                    (state.rows_processed / max(state.total_rows, 1)) * 100, 2
+                )
+            elif status in failure_states:
+                pending.pop(task_id)
+                state.rows_processed += 1
+                state.progress_percentage = round(
+                    (state.rows_processed / max(state.total_rows, 1)) * 100, 2
+                )
 
-    if status in failure_states:
-        raise RuntimeError(f"enrich_lead job failed for task_id={task_id}: {status_payload}")
-
-    if status not in success_states or status_payload is None:
-        raise RuntimeError(
-            f"enrich_lead job timed out waiting for completion for task_id={task_id}; "
-            f"last_status={status or 'unknown'}"
-        )
-
-    result = _extract_enrich_fields(status_payload)
-    for key, value in result.items():
-        df.at[target_row_index, key] = value
-
-    state.rows_processed = 1
+    # Any rows still pending have timed out — mark as done
+    state.rows_processed = state.total_rows
     state.progress_percentage = 100.0
 
 
@@ -435,9 +457,6 @@ async def _run_find_email_block(
         state.progress_percentage = round((processed / max(state.total_rows, 1)) * 100, 2)
 
 
-_BACKEND_DIR = Path(__file__).parent
-
-
 def _resolve_path(path: str) -> Path:
     """Resolve a path relative to the backend directory when it is not absolute."""
     p = Path(path)
@@ -473,7 +492,11 @@ async def _run_fast_block(state: WorkflowState, block: Block) -> None:
         value = params.get("value")
 
         if operator == "equals":
-            mask = state.dataframe[column] == value
+            # Coerce "True"/"False" strings so boolean columns (from compute_column) filter correctly
+            coerced = value
+            if isinstance(value, str) and value.lower() in {"true", "false"}:
+                coerced = value.lower() == "true"
+            mask = state.dataframe[column] == coerced
         elif operator == "contains":
             mask = state.dataframe[column].astype(str).str.contains(str(value), na=False)
         elif operator == "gt":
@@ -684,6 +707,26 @@ async def download_workflow_output(workflow_id: str) -> FileResponse:
         media_type="text/csv",
         filename=output.name,
         headers={"Content-Disposition": f'attachment; filename="{output.name}"'},
+    )
+
+
+@app.get("/files/download")
+async def download_file_by_path(path: str) -> FileResponse:
+    """Serve a file from the backend directory by relative or absolute path."""
+    resolved = _resolve_path(path)
+    backend_dir = _BACKEND_DIR.resolve()
+    # Safety: only allow files that live inside the backend directory tree
+    try:
+        resolved.relative_to(backend_dir)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access to that path is not permitted.")
+    if not resolved.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+    return FileResponse(
+        path=str(resolved),
+        media_type="text/csv",
+        filename=resolved.name,
+        headers={"Content-Disposition": f'attachment; filename="{resolved.name}"'},
     )
 
 

@@ -1,5 +1,5 @@
-import { WorkflowStudio } from "@/components/workflow-studio";
+import { ClientShell } from "./client-shell";
 
 export default function Home() {
-  return <WorkflowStudio />;
+  return <ClientShell />;
 }
