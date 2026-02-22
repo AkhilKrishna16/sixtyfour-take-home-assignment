@@ -272,7 +272,7 @@ export function ConfigPanel({
                           onChange={(e) => onUpdateBlock(configBlock.id, { source_column: e.target.value })}
                         >
                           <option value="" className="bg-[#0f0f1a]">— select column —</option>
-                          {["name", "email", "company", "linkedin"].map((h) => (
+                          {(headers.length ? headers : ["name", "email", "company", "linkedin"]).map((h) => (
                             <option key={h} value={h} className="bg-[#0f0f1a]">{h}</option>
                           ))}
                         </select>

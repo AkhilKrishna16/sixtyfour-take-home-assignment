@@ -26,7 +26,7 @@ import {
   makeId,
   DEFAULT_ENRICH_STRUCT,
 } from "./workflow-studio/constants";
-import { parseCsv } from "./workflow-studio/utils";
+import { parseCsv, getEffectiveHeaders } from "./workflow-studio/utils";
 import {
   IcPlus, IcPlay, IcCheck, IcX, IcLoader, IcGrip,
   IcUpload, IcFile,
@@ -105,6 +105,15 @@ export function WorkflowStudio() {
   /* ── Derived values (ORDER MATTERS) ─────────────────────────────────── */
   const configBlock  = pipeline.find((b) => b.id === configBlockId) ?? null;
   const pipelineIds  = pipeline.map((b) => b.id);
+
+  /* Headers available at the position of the currently-configured block:
+     original CSV columns + any columns produced by upstream blocks. */
+  const effectiveHeaders = useMemo(() => {
+    if (!configBlock) return headers;
+    const blockIndex = pipeline.findIndex((b) => b.id === configBlock.id);
+    if (blockIndex <= 0) return headers;
+    return getEffectiveHeaders(pipeline, blockIndex, headers, Object.keys(DEFAULT_ENRICH_STRUCT));
+  }, [configBlock, pipeline, headers]);
 
 
   const filterBlocks       = pipeline.filter((b) => b.type === "filter");
@@ -888,7 +897,7 @@ export function WorkflowStudio() {
       <ConfigPanel
         configBlock={configBlock}
         configBlockId={configBlockId}
-        headers={headers}
+        headers={effectiveHeaders}
         onClose={() => setConfigBlockId(null)}
         onUpdateBlock={updateBlock}
       />
