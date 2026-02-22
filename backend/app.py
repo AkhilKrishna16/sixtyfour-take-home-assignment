@@ -229,8 +229,6 @@ def _extract_enrich_fields(status_payload: dict[str, Any]) -> dict[str, Any]:
 
     if "confidence_score" in result:
         merged["enrich_confidence_score"] = result.get("confidence_score")
-    if "notes" in result:
-        merged["enrich_notes"] = result.get("notes")
     return merged
 
 
@@ -437,13 +435,24 @@ async def _run_find_email_block(
         state.progress_percentage = round((processed / max(state.total_rows, 1)) * 100, 2)
 
 
+_BACKEND_DIR = Path(__file__).parent
+
+
+def _resolve_path(path: str) -> Path:
+    """Resolve a path relative to the backend directory when it is not absolute."""
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return (_BACKEND_DIR / p).resolve()
+
+
 async def _run_fast_block(state: WorkflowState, block: Block) -> None:
     params = block.params
     if block.type == "read_csv":
         path = params.get("path")
         if not path:
             raise ValueError("read_csv requires params.path")
-        df = pd.read_csv(path)
+        df = pd.read_csv(_resolve_path(str(path)))
         if df.empty:
             raise ValueError(f"CSV at '{path}' is empty — no rows found.")
         if len(df.columns) == 0:
@@ -494,7 +503,7 @@ async def _run_fast_block(state: WorkflowState, block: Block) -> None:
         output_path = params.get("path")
         if not output_path:
             raise ValueError("save_csv requires params.path")
-        output = Path(output_path)
+        output = _resolve_path(str(output_path))
         output.parent.mkdir(parents=True, exist_ok=True)
         state.dataframe.to_csv(output, index=False)
         state.output_path = str(output)

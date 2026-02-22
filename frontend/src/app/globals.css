@@ -51,7 +51,12 @@ body {
   100% { offset-distance: 100%; opacity: 0; }
 }
 
-.animate-pulse-ring { animation: pulse-ring 1.6s ease-in-out infinite; }
+@keyframes spin-loader {
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin-loader  { animation: spin-loader 0.9s linear infinite; }
+.animate-pulse-ring   { animation: pulse-ring 1.6s ease-in-out infinite; }
 .animate-flow-line  { animation: flow-line 1.2s linear infinite; }
 .animate-slide-up   { animation: slide-up 0.22s ease-out both; }
 .animate-fade-in    { animation: fade-in 0.18s ease-out both; }
