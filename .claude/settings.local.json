@@ -6,7 +6,11 @@
       "Bash(npx next build:*)",
       "Bash(cd C:\\\\Users\\\\Akhil\\\\Desktop\\\\WOrk\\\\sixtyfour-take-home-assignment\\\\backend:*)",
       "Bash(echo EXIT:$?:*)",
-      "WebFetch(domain:docs.sixtyfour.ai)"
+      "WebFetch(domain:docs.sixtyfour.ai)",
+      "Bash(echo Backend not responding yet:*)",
+      "Bash(curl:*)",
+      "Bash(sleep 3:*)",
+      "Bash(echo WF2_ID: $WF2_ID:*)"
     ]
   }
 }

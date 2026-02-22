@@ -431,6 +431,29 @@ export function WorkflowStudio() {
     }
   };
 
+  const downloadWorkflowOutput = async (workflowId: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/workflows/${workflowId}/download`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        showToast(body?.detail ?? `Download failed — server returned ${res.status}`);
+        return;
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") ?? "";
+      const filename = cd.match(/filename="?([^"]+)"?/)?.[1] ?? "output.csv";
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+    } catch (e) {
+      showToast(`Download failed — ${e instanceof Error ? e.message : "unknown error"}`);
+    }
+  };
+
   const openQueueItem = (item: QueueItem) => {
     /* Auto-save the current draft whenever navigating away from it. */
     if (isDraftView && pipeline.length > 0) {

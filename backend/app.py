@@ -492,11 +492,15 @@ async def _run_fast_block(state: WorkflowState, block: Block) -> None:
         value = params.get("value")
 
         if operator == "equals":
-            # Coerce "True"/"False" strings so boolean columns (from compute_column) filter correctly
-            coerced = value
+            # Handle boolean-like strings: match both Python bool and string representation
+            # e.g. enrich_lead returns "True"/"False" strings, compute_column may return bool True/False
             if isinstance(value, str) and value.lower() in {"true", "false"}:
-                coerced = value.lower() == "true"
-            mask = state.dataframe[column] == coerced
+                bool_val = value.lower() == "true"
+                str_val = str(bool_val)  # "True" or "False"
+                mask = (state.dataframe[column] == bool_val) | \
+                       (state.dataframe[column].astype(str) == str_val)
+            else:
+                mask = state.dataframe[column] == value
         elif operator == "contains":
             mask = state.dataframe[column].astype(str).str.contains(str(value), na=False)
         elif operator == "gt":
