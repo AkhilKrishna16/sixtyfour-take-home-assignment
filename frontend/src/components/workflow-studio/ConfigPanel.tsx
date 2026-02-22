@@ -314,7 +314,7 @@ export function ConfigPanel({
                             : (op === "gt" || op === "lt")
                               ? <>pd.to_numeric(df[<span className="text-violet-300">&apos;{String(configBlock.params.source_column)}&apos;</span>]) {op === "gt" ? ">" : "<"} <span className="text-emerald-300">{String(configBlock.params.value ?? "")}</span></>
                               : (op === "contains" || op === "not_contains")
-                                ? <>df[<span className="text-violet-300">&apos;{String(configBlock.params.source_column)}&apos;</span>].str.{op}(<span className="text-emerald-300">&apos;{String(configBlock.params.value ?? "")}&apos;</span>)</>
+                                ? <>{op === "not_contains" ? "~" : ""}df[<span className="text-violet-300">&apos;{String(configBlock.params.source_column)}&apos;</span>].str.contains(<span className="text-emerald-300">&apos;{String(configBlock.params.value ?? "")}&apos;</span>)</>
                                 : <>df[<span className="text-violet-300">&apos;{String(configBlock.params.source_column)}&apos;</span>] {op === "not_equals" ? "!=" : "=="} <span className="text-emerald-300">&apos;{String(configBlock.params.value ?? "")}&apos;</span></>
                           }
                         </div>
